@@ -2,9 +2,9 @@ name: coverage
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, nabto ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, nabto ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
