@@ -961,7 +961,7 @@ where
 
                             let track = sender.track();
                             if dmsid.split_whitespace().next()
-                                != Some(&format!("{} {}", track.stream_id(), track.track_id()))
+                                != Some(track.stream_id())
                             {
                                 return true;
                             }
