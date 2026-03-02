@@ -285,6 +285,10 @@ where
     }
 
     fn poll_write(&mut self) -> Option<Self::Wout> {
+        if let Some(wout) = self.pipeline_context.write_outs.pop_front() {
+            return Some(wout);
+        }
+
         let mut intermediate_wouts = VecDeque::new();
 
         for_each_handler!(reverse: process_handler!(self, handler, {
