@@ -3,7 +3,6 @@ use aes::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use bytes::{BufMut, BytesMut};
 use rtcp::header::{HEADER_LENGTH, SSRC_LENGTH};
 use shared::marshal::*;
-use subtle::ConstantTimeEq;
 
 use super::{Cipher, CipherInner};
 use crate::cipher::Kdf;
@@ -135,13 +134,9 @@ impl Cipher for CipherAesCmHmacSha1 {
         let actual_tag = &encrypted[encrypted_len - self.rtp_auth_tag_len()..];
         let cipher_text = &encrypted[..encrypted_len - self.rtp_auth_tag_len()];
 
-        // Generate the auth tag we expect to see from the ciphertext.
-        let expected_tag =
-            &self.inner.generate_srtp_auth_tag(cipher_text, roc)[..self.rtp_auth_tag_len()];
-
         // See if the auth tag actually matches.
         // We use a constant time comparison to prevent timing attacks.
-        if actual_tag.ct_eq(expected_tag).unwrap_u8() != 1 {
+        if !self.inner.verify_srtp_auth_tag(cipher_text, roc, actual_tag) {
             return Err(Error::RtpFailedToVerifyAuthTag);
         }
 
@@ -254,13 +249,9 @@ impl Cipher for CipherAesCmHmacSha1 {
 
         let cipher_text = &encrypted[..encrypted_len - self.rtcp_auth_tag_len()];
 
-        // Generate the auth tag we expect to see from the ciphertext.
-        let expected_tag =
-            &self.inner.generate_srtcp_auth_tag(cipher_text)[..self.rtcp_auth_tag_len()];
-
         // See if the auth tag actually matches.
         // We use a constant time comparison to prevent timing attacks.
-        if actual_tag.ct_eq(expected_tag).unwrap_u8() != 1 {
+        if !self.inner.verify_srtcp_auth_tag(cipher_text, actual_tag) {
             return Err(Error::RtcpFailedToVerifyAuthTag);
         }
 
