@@ -1,12 +1,6 @@
-use std::marker::PhantomData;
-
-use aead::consts::{U12, U16};
-use aes::cipher::{BlockEncrypt, BlockSizeUser, Unsigned};
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{AesGcm, KeyInit, Nonce};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::BytesMut;
+use ring::aead;
 
 use super::{Cipher, Kdf};
 use crate::key_derivation::*;
@@ -21,24 +15,15 @@ pub const CIPHER_AEAD_AES_GCM_AUTH_TAG_LEN: usize = 16;
 const RTCP_ENCRYPTION_FLAG: u8 = 0x80;
 
 /// AEAD Cipher based on AES.
-pub(crate) struct CipherAeadAesGcm<AES, NonceSize = U12>
-where
-    NonceSize: Unsigned,
-{
+pub(crate) struct CipherAeadAesGcm {
     profile: ProtectionProfile,
-    srtp_cipher: aes_gcm::AesGcm<AES, NonceSize>,
-    srtcp_cipher: aes_gcm::AesGcm<AES, NonceSize>,
+    srtp_cipher: aead::LessSafeKey,
+    srtcp_cipher: aead::LessSafeKey,
     srtp_session_salt: Vec<u8>,
     srtcp_session_salt: Vec<u8>,
-    _tag: PhantomData<AES>,
 }
 
-impl<AES, NS> Cipher for CipherAeadAesGcm<AES, NS>
-where
-    NS: Unsigned + Send + Sync,
-    AES: BlockEncrypt + KeyInit + BlockSizeUser<BlockSize = U16> + Send + Sync + 'static,
-    AesGcm<AES, NS>: Aead,
-{
+impl Cipher for CipherAeadAesGcm {
     fn rtp_auth_tag_len(&self) -> usize {
         self.profile.rtp_auth_tag_len()
     }
@@ -61,17 +46,18 @@ where
         // Copy header unencrypted.
         writer.extend_from_slice(&payload[..header_len]);
 
-        let nonce = self.rtp_initialization_vector(header, roc);
+        let nonce_bytes = self.rtp_initialization_vector(header, roc);
+        let nonce =
+            aead::Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| Error::Other("invalid nonce".into()))?;
+        let aad = aead::Aad::from(&writer[..]);
 
-        let encrypted = self.srtp_cipher.encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &payload[header_len..],
-                aad: &writer,
-            },
-        )?;
+        // in_out = plaintext payload, will be encrypted in place with tag appended
+        let mut in_out = payload[header_len..].to_vec();
+        self.srtp_cipher
+            .seal_in_place_append_tag(nonce, aad, &mut in_out)
+            .map_err(|_| Error::Other("SRTP encrypt failed".into()))?;
 
-        writer.extend_from_slice(&encrypted);
+        writer.extend_from_slice(&in_out);
         Ok(writer)
     }
 
@@ -85,19 +71,21 @@ where
             return Err(Error::ErrFailedToVerifyAuthTag);
         }
 
-        let nonce = self.rtp_initialization_vector(header, roc);
+        let nonce_bytes = self.rtp_initialization_vector(header, roc);
+        let nonce =
+            aead::Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| Error::Other("invalid nonce".into()))?;
         let payload_offset = header.marshal_size();
-        let decrypted_msg: Vec<u8> = self.srtp_cipher.decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &ciphertext[payload_offset..],
-                aad: &ciphertext[..payload_offset],
-            },
-        )?;
+        let aad = aead::Aad::from(&ciphertext[..payload_offset]);
 
-        let mut writer = BytesMut::with_capacity(payload_offset + decrypted_msg.len());
+        let mut in_out = ciphertext[payload_offset..].to_vec();
+        let decrypted = self
+            .srtp_cipher
+            .open_in_place(nonce, aad, &mut in_out)
+            .map_err(|_| Error::ErrFailedToVerifyAuthTag)?;
+
+        let mut writer = BytesMut::with_capacity(payload_offset + decrypted.len());
         writer.extend_from_slice(&ciphertext[..payload_offset]);
-        writer.extend_from_slice(&decrypted_msg);
+        writer.extend_from_slice(decrypted);
 
         Ok(writer)
     }
@@ -108,21 +96,21 @@ where
         srtcp_index: usize,
         ssrc: u32,
     ) -> Result<BytesMut> {
-        let iv = self.rtcp_initialization_vector(srtcp_index, ssrc);
-        let aad = self.rtcp_additional_authenticated_data(decrypted, srtcp_index);
+        let iv_bytes = self.rtcp_initialization_vector(srtcp_index, ssrc);
+        let nonce =
+            aead::Nonce::try_assume_unique_for_key(&iv_bytes).map_err(|_| Error::Other("invalid nonce".into()))?;
+        let aad_data = self.rtcp_additional_authenticated_data(decrypted, srtcp_index);
+        let aad = aead::Aad::from(&aad_data);
 
-        let encrypted_data = self.srtcp_cipher.encrypt(
-            Nonce::from_slice(&iv),
-            Payload {
-                msg: &decrypted[8..],
-                aad: &aad,
-            },
-        )?;
+        let mut in_out = decrypted[8..].to_vec();
+        self.srtcp_cipher
+            .seal_in_place_append_tag(nonce, aad, &mut in_out)
+            .map_err(|_| Error::Other("SRTCP encrypt failed".into()))?;
 
-        let mut writer = BytesMut::with_capacity(encrypted_data.len() + aad.len());
+        let mut writer = BytesMut::with_capacity(in_out.len() + aad_data.len());
         writer.extend_from_slice(&decrypted[..8]);
-        writer.extend_from_slice(&encrypted_data);
-        writer.extend_from_slice(&aad[8..]);
+        writer.extend_from_slice(&in_out);
+        writer.extend_from_slice(&aad_data[8..]);
 
         Ok(writer)
     }
@@ -137,20 +125,21 @@ where
             return Err(Error::ErrFailedToVerifyAuthTag);
         }
 
-        let nonce = self.rtcp_initialization_vector(srtcp_index, ssrc);
-        let aad = self.rtcp_additional_authenticated_data(encrypted, srtcp_index);
+        let nonce_bytes = self.rtcp_initialization_vector(srtcp_index, ssrc);
+        let nonce =
+            aead::Nonce::try_assume_unique_for_key(&nonce_bytes).map_err(|_| Error::Other("invalid nonce".into()))?;
+        let aad_data = self.rtcp_additional_authenticated_data(encrypted, srtcp_index);
+        let aad = aead::Aad::from(&aad_data);
 
-        let decrypted_data = self.srtcp_cipher.decrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &encrypted[8..(encrypted.len() - SRTCP_INDEX_SIZE)],
-                aad: &aad,
-            },
-        )?;
+        let mut in_out = encrypted[8..(encrypted.len() - SRTCP_INDEX_SIZE)].to_vec();
+        let decrypted = self
+            .srtcp_cipher
+            .open_in_place(nonce, aad, &mut in_out)
+            .map_err(|_| Error::ErrFailedToVerifyAuthTag)?;
 
-        let mut writer = BytesMut::with_capacity(8 + decrypted_data.len());
+        let mut writer = BytesMut::with_capacity(8 + decrypted.len());
         writer.extend_from_slice(&encrypted[..8]);
-        writer.extend_from_slice(&decrypted_data);
+        writer.extend_from_slice(decrypted);
 
         Ok(writer)
     }
@@ -163,25 +152,25 @@ where
     }
 }
 
-impl<AES, NS> CipherAeadAesGcm<AES, NS>
-where
-    NS: Unsigned,
-    AES: BlockEncrypt + KeyInit + BlockSizeUser<BlockSize = U16> + 'static,
-    AesGcm<AES, NS>: Aead,
-{
+impl CipherAeadAesGcm {
     /// Create a new AEAD instance.
     pub(crate) fn new(
         profile: ProtectionProfile,
         master_key: &[u8],
         master_salt: &[u8],
-    ) -> Result<CipherAeadAesGcm<AES>> {
-        assert_eq!(profile.aead_auth_tag_len(), AES::block_size());
-        assert_eq!(profile.key_len(), AES::key_size());
+    ) -> Result<CipherAeadAesGcm> {
+        let algorithm = match profile {
+            ProtectionProfile::AeadAes128Gcm => &aead::AES_128_GCM,
+            ProtectionProfile::AeadAes256Gcm => &aead::AES_256_GCM,
+            _ => unreachable!(),
+        };
+
+        assert_eq!(profile.aead_auth_tag_len(), 16);
+        assert_eq!(profile.key_len(), algorithm.key_len());
         assert_eq!(profile.salt_len(), master_salt.len());
 
         let kdf: Kdf = match profile {
             ProtectionProfile::AeadAes128Gcm => aes_cm_key_derivation,
-            // AES_256_GCM must use AES_256_CM_PRF as per https://datatracker.ietf.org/doc/html/rfc7714#section-11
             ProtectionProfile::AeadAes256Gcm => aes_256_cm_key_derivation,
             _ => unreachable!(),
         };
@@ -194,9 +183,9 @@ where
             master_key.len(),
         )?;
 
-        let srtp_block = GenericArray::from_slice(&srtp_session_key);
-
-        let srtp_cipher = AesGcm::<AES, U12>::new(srtp_block);
+        let srtp_unbound = aead::UnboundKey::new(algorithm, &srtp_session_key)
+            .map_err(|_| Error::Other("invalid SRTP key".into()))?;
+        let srtp_cipher = aead::LessSafeKey::new(srtp_unbound);
 
         let srtcp_session_key = kdf(
             LABEL_SRTCP_ENCRYPTION,
@@ -206,9 +195,9 @@ where
             master_key.len(),
         )?;
 
-        let srtcp_block = GenericArray::from_slice(&srtcp_session_key);
-
-        let srtcp_cipher = AesGcm::<AES, U12>::new(srtcp_block);
+        let srtcp_unbound = aead::UnboundKey::new(algorithm, &srtcp_session_key)
+            .map_err(|_| Error::Other("invalid SRTCP key".into()))?;
+        let srtcp_cipher = aead::LessSafeKey::new(srtcp_unbound);
 
         let srtp_session_salt = kdf(
             LABEL_SRTP_SALT,
@@ -232,7 +221,6 @@ where
             srtcp_cipher,
             srtp_session_salt,
             srtcp_session_salt,
-            _tag: PhantomData,
         })
     }
 
@@ -298,8 +286,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use aes::{Aes128, Aes256};
-
     use super::*;
 
     #[test]
@@ -308,8 +294,7 @@ mod tests {
         let master_key = vec![0u8; profile.key_len()];
         let master_salt = vec![0u8; 12];
 
-        let mut cipher =
-            CipherAeadAesGcm::<Aes128>::new(profile, &master_key, &master_salt).unwrap();
+        let mut cipher = CipherAeadAesGcm::new(profile, &master_key, &master_salt).unwrap();
 
         let header = rtp::Header {
             ssrc: 0x12345678,
@@ -329,8 +314,7 @@ mod tests {
         let master_key = vec![0u8; profile.key_len()];
         let master_salt = vec![0u8; 12];
 
-        let mut cipher =
-            CipherAeadAesGcm::<Aes256>::new(profile, &master_key, &master_salt).unwrap();
+        let mut cipher = CipherAeadAesGcm::new(profile, &master_key, &master_salt).unwrap();
 
         let header = rtp::Header {
             ssrc: 0x12345678,
