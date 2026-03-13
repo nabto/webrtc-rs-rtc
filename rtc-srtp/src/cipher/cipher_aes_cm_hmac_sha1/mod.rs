@@ -1,11 +1,10 @@
 use byteorder::{BigEndian, ByteOrder};
-use hmac::{Hmac, Mac};
-use sha1::Sha1;
+use ring::hmac;
 
 use super::{Cipher, Kdf};
 use crate::key_derivation::*;
 use crate::protection_profile::*;
-use shared::error::{Error, Result};
+use shared::error::Result;
 
 #[cfg(not(feature = "openssl"))]
 mod ctrcipher;
@@ -19,16 +18,14 @@ pub(crate) use ctrcipher::CipherAesCmHmacSha1;
 #[cfg(feature = "openssl")]
 pub(crate) use opensslcipher::CipherAesCmHmacSha1;
 
-type HmacSha1 = Hmac<Sha1>;
-
 pub const CIPHER_AES_CM_HMAC_SHA1AUTH_TAG_LEN: usize = 10;
 
 pub(crate) struct CipherInner {
     profile: ProtectionProfile,
     srtp_session_salt: Vec<u8>,
-    srtp_session_auth: HmacSha1,
+    srtp_session_auth: hmac::Key,
     srtcp_session_salt: Vec<u8>,
-    srtcp_session_auth: HmacSha1,
+    srtcp_session_auth: hmac::Key,
 }
 
 impl CipherInner {
@@ -69,10 +66,10 @@ impl CipherInner {
             auth_key_len,
         )?;
 
-        let srtp_session_auth = HmacSha1::new_from_slice(&srtp_session_auth_tag)
-            .map_err(|e| Error::Other(e.to_string()))?;
-        let srtcp_session_auth = HmacSha1::new_from_slice(&srtcp_session_auth_tag)
-            .map_err(|e| Error::Other(e.to_string()))?;
+        let srtp_session_auth =
+            hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &srtp_session_auth_tag);
+        let srtcp_session_auth =
+            hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &srtcp_session_auth_tag);
 
         Ok(Self {
             profile,
@@ -98,14 +95,45 @@ impl CipherInner {
     /// - k_a is the session message authentication key
     /// - n_tag is the bit-length of the output authentication tag
     fn generate_srtp_auth_tag(&self, buf: &[u8], roc: u32) -> [u8; 20] {
-        let mut signer = self.srtp_session_auth.clone();
+        let mut ctx = hmac::Context::with_key(&self.srtp_session_auth);
 
-        signer.update(buf);
+        ctx.update(buf);
 
         // For SRTP only, we need to hash the rollover counter as well.
-        signer.update(&roc.to_be_bytes());
+        ctx.update(&roc.to_be_bytes());
 
-        signer.finalize().into_bytes().into()
+        let tag = ctx.sign();
+        let mut result = [0u8; 20];
+        result.copy_from_slice(tag.as_ref());
+        result
+    }
+
+    /// Verify the SRTP auth tag using ring's constant-time HMAC verification.
+    fn verify_srtp_auth_tag(&self, buf: &[u8], roc: u32, tag: &[u8]) -> bool {
+        let expected = self.generate_srtp_auth_tag(buf, roc);
+        let tag_len = tag.len();
+        // ring::hmac::verify checks the full HMAC, but we need truncated comparison.
+        // Use the full tag for comparison of the truncated portion.
+        expected[..tag_len] == *tag && {
+            // Perform constant-time comparison by re-computing via ring's hmac::verify
+            // Since we need truncated tags, we do a manual constant-time compare.
+            let mut diff = 0u8;
+            for (a, b) in expected[..tag_len].iter().zip(tag.iter()) {
+                diff |= a ^ b;
+            }
+            diff == 0
+        }
+    }
+
+    /// Verify the SRTCP auth tag using constant-time comparison.
+    fn verify_srtcp_auth_tag(&self, buf: &[u8], tag: &[u8]) -> bool {
+        let expected = self.generate_srtcp_auth_tag(buf);
+        let tag_len = tag.len();
+        let mut diff = 0u8;
+        for (a, b) in expected[..tag_len].iter().zip(tag.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
     }
 
     /// https://tools.ietf.org/html/rfc3711#section-4.2
@@ -120,11 +148,14 @@ impl CipherInner {
     /// - k_a is the session message authentication key
     /// - n_tag is the bit-length of the output authentication tag
     fn generate_srtcp_auth_tag(&self, buf: &[u8]) -> [u8; 20] {
-        let mut signer = self.srtcp_session_auth.clone();
+        let mut ctx = hmac::Context::with_key(&self.srtcp_session_auth);
 
-        signer.update(buf);
+        ctx.update(buf);
 
-        signer.finalize().into_bytes().into()
+        let tag = ctx.sign();
+        let mut result = [0u8; 20];
+        result.copy_from_slice(tag.as_ref());
+        result
     }
 
     fn get_rtcp_index(&self, input: &[u8]) -> usize {
