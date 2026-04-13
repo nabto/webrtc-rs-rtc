@@ -1,18 +1,23 @@
-/// Regression test: panic in ICE agent when a peer-reflexive candidate is
-/// discovered after the Checking timeout has silently expired.
+/// Regression test: the ICE agent used to panic when a peer-reflexive
+/// candidate was discovered after the Checking timeout had silently expired.
 ///
-/// Crash path (rtc-ice/src/agent/mod.rs `handle_inbound`):
+/// Historical crash path (rtc-ice/src/agent/mod.rs `handle_inbound`):
 ///   1. ICE agent is in Checking state; timeout has elapsed but hasn't been
 ///      detected yet (handle_timeout was not called)
 ///   2. A STUN binding request arrives from an address not in remote_candidates
 ///   3. handle_inbound creates a peer-reflexive candidate via add_remote_candidate
 ///   4. add_remote_candidate → request_connectivity_check → contact()
-///   5. contact() detects the expired timeout → Failed → clears candidate vectors
-///   6. Back in handle_inbound: `self.remote_candidates.len() - 1` underflows
-///      (debug: panics with "subtract with overflow")
-///      (release: wraps to usize::MAX, execution continues into add_pair where
-///      `local_candidates[local_index]` panics — local_index is the stale value
-///      from find_local_candidate before the clear, e.g. 2)
+///   5. contact() detected the expired timeout → Failed → cleared candidate vectors
+///   6. Back in handle_inbound: `self.remote_candidates.len() - 1` underflowed
+///      ("subtract with overflow" in debug; stale-index access in release).
+///
+/// Fix: `request_connectivity_check` now only sets `pending_connectivity_check`
+/// so the next `handle_timeout` tick runs `contact` outside the inbound call
+/// stack. `delete_all_candidates_and_pairs` also clears `candidate_pairs` and
+/// `selected_pair`, so no stale indices can survive a Failed transition.
+///
+/// After the fix this test verifies that the offerer transitions cleanly to
+/// `RTCIceConnectionState::Failed` instead of panicking.
 ///
 /// Trigger: the answer peer's candidate is added AFTER the SDP exchange so the
 /// offer peer doesn't know the answer's address. When the answer's STUN packets
@@ -26,13 +31,14 @@ use tokio::net::UdpSocket;
 use rtc::peer_connection::RTCPeerConnectionBuilder;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
+use rtc::peer_connection::event::RTCPeerConnectionEvent;
+use rtc::peer_connection::state::RTCIceConnectionState;
 use rtc::peer_connection::transport::RTCDtlsRole;
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 use rtc::peer_connection::transport::{CandidateConfig, CandidateHostConfig, RTCIceCandidate};
 
 #[tokio::test]
-#[should_panic(expected = "subtract with overflow")]
-async fn test_ice_failed_stale_index_panic_on_peer_reflexive() {
+async fn test_ice_transitions_to_failed_when_peer_reflexive_discovered_after_checking_timeout() {
     let disconnected_timeout = Duration::from_secs(1);
     let failed_timeout = Duration::from_secs(1);
     let checking_timeout = disconnected_timeout + failed_timeout;
@@ -117,10 +123,18 @@ async fn test_ice_failed_stale_index_panic_on_peer_reflexive() {
         })
         .unwrap();
 
+    // Let the offerer tick its timer ONCE so its ICE agent records the
+    // moment it entered Checking (`checking_duration`). Without this the
+    // checking timer never starts, and the later "expired timeout"
+    // premise of this test doesn't hold.
+    offer_pc.handle_timeout(Instant::now()).ok();
+    while offer_pc.poll_write().is_some() {}
+    while offer_pc.poll_event().is_some() {}
+
     // --- Drive the answer peer until the checking timeout expires ---
     // The answer peer sends STUN binding requests to the offer socket.
-    // We capture them but do NOT call handle_timeout on the offer peer,
-    // so its checking timeout expires silently.
+    // We capture them but do NOT call handle_timeout on the offer peer
+    // again, so its checking timeout expires silently.
     let mut captured = Vec::new();
     let mut buf = vec![0u8; 2000];
     let start = Instant::now();
@@ -149,11 +163,21 @@ async fn test_ice_failed_stale_index_panic_on_peer_reflexive() {
 
     assert!(!captured.is_empty(), "need at least one STUN packet from answer");
 
+    // Drain any events queued on the offerer before this point so we only
+    // observe the state change triggered below.
+    let mut last_ice_state = None;
+    while let Some(evt) = offer_pc.poll_event() {
+        if let RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(state) = evt {
+            last_ice_state = Some(state);
+        }
+    }
+
     // --- Deliver a captured STUN packet to the offer peer ---
     // The offer's ICE is in Checking with an expired timeout. handle_inbound
-    // will discover a peer-reflexive candidate, call contact() which detects
-    // the timeout and transitions to Failed (clearing candidates), then try
-    // to use the now-empty candidate vectors → panic.
+    // discovers a peer-reflexive candidate and marks pending_connectivity_check
+    // so the next handle_timeout tick runs contact outside the inbound call
+    // stack. The subsequent handle_timeout then notices the expired checking
+    // timeout and transitions the agent to Failed cleanly.
     let (pkt, peer) = captured.last().unwrap();
     offer_pc
         .handle_read(TaggedBytesMut {
@@ -167,4 +191,27 @@ async fn test_ice_failed_stale_index_panic_on_peer_reflexive() {
             message: pkt.clone(),
         })
         .ok();
+
+    // Drive the offer peer so the deferred contact runs, detects the expired
+    // checking timeout, transitions to Failed, and propagates the state change
+    // through the rtc handler chain into peer-connection events.
+    for _ in 0..10 {
+        offer_pc.handle_timeout(Instant::now()).ok();
+        while offer_pc.poll_write().is_some() {}
+        while offer_pc.poll_read().is_some() {}
+        while let Some(evt) = offer_pc.poll_event() {
+            if let RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(state) = evt {
+                last_ice_state = Some(state);
+            }
+        }
+        if last_ice_state == Some(RTCIceConnectionState::Failed) {
+            break;
+        }
+    }
+
+    assert_eq!(
+        last_ice_state,
+        Some(RTCIceConnectionState::Failed),
+        "offerer should transition to ICE Failed after peer-reflexive discovery on expired checking timeout",
+    );
 }

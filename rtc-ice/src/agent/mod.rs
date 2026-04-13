@@ -118,6 +118,9 @@ pub struct Agent {
     // LRU of outbound Binding request Transaction IDs
     pub(crate) pending_binding_requests: Vec<BindingRequest>,
 
+    // Set to true if we want to make a connectivity check from the timeout handler
+    pub(crate) pending_connectivity_check: bool,
+
     // the following variables won't be changed after init_with_defaults()
     pub(crate) insecure_skip_verify: bool,
     pub(crate) max_binding_requests: u16,
@@ -170,6 +173,7 @@ impl Default for Agent {
             nominated_pair: None,
             selected_pair: None,
             pending_binding_requests: vec![],
+            pending_connectivity_check: false,
             insecure_skip_verify: false,
             max_binding_requests: 0,
             host_acceptance_min_wait: Default::default(),
@@ -340,6 +344,7 @@ impl Agent {
 
             // LRU of outbound Binding request Transaction IDs
             pending_binding_requests: vec![],
+            pending_connectivity_check: false,
 
             candidate_types,
             network_types: config.network_types.clone(),
@@ -593,6 +598,7 @@ impl Agent {
             }
             _ => {}
         };
+
         // Ensure we run our task loop as quickly as the minimum of our various configured timeouts
         update_interval(disconnected_timeout);
         update_interval(failed_timeout);
@@ -673,11 +679,9 @@ impl Agent {
         self.ufrag_pwd.remote_credentials = None;
 
         self.pending_binding_requests = vec![];
+        self.pending_connectivity_check = false;
 
-        self.candidate_pairs = vec![];
-
-        self.set_selected_pair(None);
-        self.delete_all_candidates(keep_local_candidates);
+        self.delete_all_candidates_and_pairs(keep_local_candidates);
         self.start();
 
         // Restart is used by NewAgent. Accept/Connect should be used to move to checking
@@ -729,8 +733,7 @@ impl Agent {
         if self.connection_state != new_state {
             // Connection has gone to failed, release all gathered candidates
             if new_state == ConnectionState::Failed {
-                self.set_selected_pair(None);
-                self.delete_all_candidates(false);
+                self.delete_all_candidates_and_pairs(false);
             }
 
             info!(
@@ -912,15 +915,17 @@ impl Agent {
 
     fn request_connectivity_check(&mut self) {
         if self.ufrag_pwd.remote_credentials.is_some() {
-            self.contact(Instant::now());
+            self.pending_connectivity_check = true;
         }
     }
 
-    /// Remove all candidates.
+    /// Remove all candidates, candidate pairs, and the selected pair.
     /// This closes any listening sockets and removes both the local and remote candidate lists.
     ///
     /// This is used for restarts, failures and on close.
-    pub(crate) fn delete_all_candidates(&mut self, keep_local_candidates: bool) {
+    pub(crate) fn delete_all_candidates_and_pairs(&mut self, keep_local_candidates: bool) {
+        self.candidate_pairs = vec![];
+        self.set_selected_pair(None);
         if !keep_local_candidates {
             self.local_candidates.clear();
         }

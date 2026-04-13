@@ -121,9 +121,10 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
         };
         self.trigger_request_connectivity_check(remote_candidates);
 
-        if self.ufrag_pwd.remote_credentials.is_some()
-            && self.last_checking_time + self.get_timeout_interval() <= now
+        if self.ufrag_pwd.remote_credentials.is_some() &&
+            (self.pending_connectivity_check || (self.last_checking_time + self.get_timeout_interval() <= now))
         {
+            self.pending_connectivity_check = false;
             self.contact(now);
         }
         Ok(())
@@ -137,7 +138,11 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
         };
 
         let ice_timeout = if self.ufrag_pwd.remote_credentials.is_some() {
-            Some(self.last_checking_time + self.get_timeout_interval())
+            if self.pending_connectivity_check {
+                Some(Instant::now())
+            } else {
+                Some(self.last_checking_time + self.get_timeout_interval())
+            }
         } else {
             None
         };
@@ -147,8 +152,7 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
     }
 
     fn close(&mut self) -> std::result::Result<(), Self::Error> {
-        self.set_selected_pair(None);
-        self.delete_all_candidates(false);
+        self.delete_all_candidates_and_pairs(false);
         self.update_connection_state(ConnectionState::Closed);
         if let Some(mdns_conn) = &mut self.mdns {
             mdns_conn.close()?;
