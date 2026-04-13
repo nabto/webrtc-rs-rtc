@@ -121,8 +121,9 @@ impl sansio::Protocol<TaggedBytesMut, (), ()> for Agent {
         };
         self.trigger_request_connectivity_check(remote_candidates);
 
-        if self.ufrag_pwd.remote_credentials.is_some() &&
-            (self.pending_connectivity_check || (self.last_checking_time + self.get_timeout_interval() <= now))
+        if self.ufrag_pwd.remote_credentials.is_some()
+            && (self.pending_connectivity_check
+                || (self.last_checking_time + self.get_timeout_interval() <= now))
         {
             self.pending_connectivity_check = false;
             self.contact(now);

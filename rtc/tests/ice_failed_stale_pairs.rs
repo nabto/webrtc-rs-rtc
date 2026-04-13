@@ -48,7 +48,9 @@ async fn test_ice_transitions_to_failed_when_peer_reflexive_discovered_after_che
     let offer_addr = offer_socket.local_addr().unwrap();
 
     let mut offer_se = SettingEngine::default();
-    offer_se.set_answering_dtls_role(RTCDtlsRole::Server).unwrap();
+    offer_se
+        .set_answering_dtls_role(RTCDtlsRole::Server)
+        .unwrap();
     offer_se.set_ice_timeouts(Some(disconnected_timeout), Some(failed_timeout), None);
 
     let mut offer_pc = RTCPeerConnectionBuilder::new()
@@ -69,7 +71,11 @@ async fn test_ice_transitions_to_failed_when_peer_reflexive_discovered_after_che
         ..Default::default()
     };
     offer_pc
-        .add_local_candidate(RTCIceCandidate::from(&host.new_candidate_host().unwrap()).to_json().unwrap())
+        .add_local_candidate(
+            RTCIceCandidate::from(&host.new_candidate_host().unwrap())
+                .to_json()
+                .unwrap(),
+        )
         .unwrap();
 
     let offer = offer_pc.create_offer(None).unwrap();
@@ -80,7 +86,9 @@ async fn test_ice_transitions_to_failed_when_peer_reflexive_discovered_after_che
     let answer_addr = answer_socket.local_addr().unwrap();
 
     let mut answer_se = SettingEngine::default();
-    answer_se.set_answering_dtls_role(RTCDtlsRole::Client).unwrap();
+    answer_se
+        .set_answering_dtls_role(RTCDtlsRole::Client)
+        .unwrap();
     answer_se.set_ice_timeouts(Some(disconnected_timeout), Some(failed_timeout), None);
 
     let mut answer_pc = RTCPeerConnectionBuilder::new()
@@ -110,7 +118,11 @@ async fn test_ice_transitions_to_failed_when_peer_reflexive_discovered_after_che
         ..Default::default()
     };
     answer_pc
-        .add_local_candidate(RTCIceCandidate::from(&host.new_candidate_host().unwrap()).to_json().unwrap())
+        .add_local_candidate(
+            RTCIceCandidate::from(&host.new_candidate_host().unwrap())
+                .to_json()
+                .unwrap(),
+        )
         .unwrap();
     answer_pc
         .add_remote_candidate(RTCIceCandidateInit {
@@ -142,7 +154,10 @@ async fn test_ice_transitions_to_failed_when_peer_reflexive_discovered_after_che
     while start.elapsed() < checking_timeout + Duration::from_millis(500) {
         // Drive the answer peer
         while let Some(msg) = answer_pc.poll_write() {
-            answer_socket.send_to(&msg.message, msg.transport.peer_addr).await.ok();
+            answer_socket
+                .send_to(&msg.message, msg.transport.peer_addr)
+                .await
+                .ok();
         }
         while answer_pc.poll_event().is_some() {}
         while answer_pc.poll_read().is_some() {}
@@ -161,7 +176,10 @@ async fn test_ice_transitions_to_failed_when_peer_reflexive_discovered_after_che
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    assert!(!captured.is_empty(), "need at least one STUN packet from answer");
+    assert!(
+        !captured.is_empty(),
+        "need at least one STUN packet from answer"
+    );
 
     // Drain any events queued on the offerer before this point so we only
     // observe the state change triggered below.
